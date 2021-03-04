@@ -1,0 +1,190 @@
+=Base de Datos I: Trabajo Práctico
+Giovanni Sia <siagiovanni1526@gmail.com>; Esteban Lanik <esteban.lanikb@gmail.com>; Lara Mariela Gauna <laragauna@gmail.com>
+v1, {docdate}. Hernan Rondelli, Hernan Czemerinski (COM-01)
+:title-page:
+:numbered:
+:source-highlighter: coderay
+:tabsize: 4
+
+
+== Introducción
+
+En el presente trabajo práctico se implementó la lógica de un modelos de datos usado para almacenar la información relativa a una tarjeta de crédito
+
+== Descripción
+
+Este sistema se ejecuta desde un archivo main.go, el cual es una aplicacion CLI desarrollada en Go la cual carga información a partir de los archivos sql.
+La base de datos consta de 9 relaciones mas 1 extra (consumo) la cual solo se utiliza para pruebas. Ademas hay un listado de triggers y stored procedures que se encargan de la lógica del control de los datos, según los eventos que ocurran. 
+
+Durante el desarrollo encontramos dificultades al idear el funcionamiento y la carga de datos de los trigger y funciones.
+La implementación de las funciones encargadas de las alertas fue complicada de implementar debido a la necesidad de comparar tiempos y a la necesidad de investigar el tema para llevarla a cabo. 
+El desarrollo de la lógica que se encarga de generar los resúmenes presento dificultades ya que al no haber una entidad resumen en el modelo, fue necesario definir las relaciones entre las tablas para hacer la carga de datos.
+Durante la implementación de la aplicacion en Go, llamar a funciones sql desde Go presento complicaciones y fue necesaria la asistencia de los docentes para solucionarlo. La lógica que carga los 120 cierres tomo mas tiempo del estimado.
+Al trabajar la base de datos no SQL, buscamos hacer que el código sea lo menos redundante posible, pero debido a las complicaciones quedó más extenso y repetitivo de lo esperado.
+Buscamos separar en dos archivos .Go la aplicacion CLI y la base de datos no SQL, pero al no lograrlo se ingresó la base de datos no SQL en la aplicacion CLI.
+Logramos solucionar e implementar dichos problemas mediante el testeo constante, la consulta a la documentacion oficial de postgres y la consulta de dudas a los docentes.
+
+== Implementación
+
+=== Función insert_cierre
+
+	for i in 0..9 loop
+		insert into cierre values(2020,generate_series(1,12),i,
+		generate_series('2020/01/01'::date,'2020/12/31','1 month'),
+		generate_series('2020/01/15'::date,'2020/12/31','1 month'),
+		generate_series('2020/01/25'::date,'2020/12/31','1 month')
+		);
+	end loop;
+	
+	Es un loop que van del 0 al 9 que representa los últimos números de una tarjeta y carga 120 registros a la tabla cierre, 
+	el año es fijo para todos los registros y los meses se van escalando con respecto al número que tiene el loop, 
+	las fechas tiene un inicio y fin y se van escalando cada mes. 
+
+
+=== Función autorizacion_compra
+
+Se encarga de verificar si la compra cumple todos los requisitos para poder ser aprobada, o rechazada. También inserta inmediatamente una alerta después de insertar un rechazo.
+
+La función recibe como parámetros numero_tarjeta, codigo_seguridad, numero_comercio y el_monto.
+    
+    autorizacion_compra(numero_tarjeta char, codigo_seguridad char, numero_comercio int, el_monto decimal)
+ 
+Lo primero que la función hace es hacer un select into, sacando todos los datos que más adelante usaremos, de la tabla tarjeta (v_nrotarjeta, v_codseguridad, v_estado, v_limitecompra, v_validahasta).
+ 
+    SELECT p.nrotarjeta, p.codseguridad, p.estado, p.limitecompra, p.validahasta
+	INTO v_nrotarjeta, v_codseguridad, v_estado, v_limitecompra, v_validahasta
+	FROM tarjeta p
+	WHERE p.nrotarjeta = numero_tarjeta ;
+
+Con los datos obtenidos, más los parámetros pasados iremos haciendo diferentes IF para ver si la compras es válida o un rechazo.
+El primer If verifica que la tarjeta sea existente, el segundo que la tarjeta no esté suspendida, el tercero que esté vigente, el cuarto que el código de seguridad sea correcto, el quinto que no se supere el límite de compra:
+
+    SELECT SUM(monto) 
+	into v_montopendiente 
+	FROM compra c
+	WHERE v_nrotarjeta=c.nrotarjeta
+	AND c.pagado = false; 
+	
+	v_montopendiente := v_montopendiente + el_monto;
+
+	IF (v_montopendiente > v_limitecompra)
+	
+Para ello sumamos todos los consumos de esa tarjeta más el monto de la nueva compra, y verificamos que esa suma no sea mayor al límite que la tarjeta tiene, también se comprueba que una tarjeta no excedió el límite más de dos veces en un dia, si pasa eso la tarjeta pasa a estar suspendida,
+y sexto que la tarjeta no esté vencida, lo que hacemos acá es tomar el año y mes actual y concatenarlos , luego preguntar si el año mes actual ,es mayor al año mes de vencimiento de la tarjeta, si es así está vencida.
+
+
+	SELECT EXTRACT(Year FROM CURRENT_DATE) into v_anioactual;
+	SELECT EXTRACT(Month FROM CURRENT_DATE) into v_mesactual;
+	
+	IF (v_anioactual|| v_mesactual > v_validahasta)
+
+Por último si no entró en ninguno de los casos anteriores significa que la compra es válida y se inserta el registro en la tabla compra.
+
+
+Esta función también, luego de insertar un rechazo, inserta un registro en la tabla alerta inmediatamente.
+
+=== Función fn_alerta_clientes()
+
+Esta función se dispara por cada insert que se haga en la tabla compras mediante su trigger. La función contempla los escenarios de una compra seguida en menos de un minuto y cinco minutos.
+Para ello hicimos un select en el que nos devuelve la hora de la última compra registrada para esa tarjeta, y si esa hora conseguida es menor a un minuto, entonces se carga una alerta, 
+
+   select co.fecha
+	into v_fecha_ultima
+	from compra co,
+	     comercio comp
+	where co.nrocomercio = comp.nrocomercio
+	and co.nrotarjeta = new.nrotarjeta
+	AND co.nrocomercio <>  new.nrocomercio
+	AND comp.codigopostal = (SELECT codigopostal 
+							 FROM comercio WHERE nrocomercio = new.nrocomercio)
+	order by nrooperacion desc
+	limit 1;
+
+la lógica para cinco minutos, es similar, las diferencias de los select es que en uno el codigo postal tiene q ser distinto y en el otro igual.
+
+Función prc_testeo()
+
+Esta función simplemente recorre la tabla consumos y los guarda en un cursor, después llamamos a ese cursor, y por cada registro hacemos ejecutar la función autorizacion_compra, la tabla consumos guarda diferentes casos para hacer funcionar todas las procedures/triggers creadas en el trabajo práctico.
+
+OPEN prueba_datos;
+	LOOP 
+	FETCH prueba_datos	
+	INTO v_nrotarjeta, v_codseguridad, v_nrocomercio, v_monto;
+
+	IF NOT FOUND THEN
+		EXIT;
+	END IF;
+	
+		PERFORM "autorizacion_compra"
+		(
+		v_nrotarjeta,
+		v_codseguridad,
+		v_nrocomercio, 
+		v_monto
+		);
+
+	END LOOP;
+
+
+=== Función funcionresumen(numcliente int, periodo int)
+
+Implementamos la lógica de la generación del resumen mediante una función, que recibe el numero de cliente y el período del anio como parámetros.
+La función contiene las siguintes variables:
+        
+//es la terminación de a tarjeta                                   termtarjeta int;  
+//numeración del resumen                                           numresumen int;   
+//monto total a pagar                                              total decimal(7,2);  
+//numeración de los detalles                                       numlinea int;        
+//mes a comparar con el periodo                                    mes int;             
+//nombre del comercio donde se haya hecho la compra                nomcomercio text;    
+//fila correspondiente al cliente                                  elcliente record;    
+//número de tarjeta del cliente                                    sutarjeta record;     
+//cierre de su tarjeta                                             sucierre record;      
+//índice para el ciclo que calcula el total a pagar                v record;             
+//índice para el ciclo que inserta filas en la relacion detalle    w record;             
+        
+En su inicio, se inicializan las siguientes variables:
+        
+                                                                                                                                                 numresumen:= 1;
+//consulta el número del ultimo registro en cabecera y suma 1 para numerar la nueva cabecera                                                     numresumen:= numresumen + count(*) from cabecera;  
+                                                                                                                                                 total:= 0; 
+                                                                                                                                                 numlinea:= 1; 
+//consulta el registro de cliente que tenga el mismo número que el cliente del parametro. Guarda la fila obtenida en la variable elcliente       select * into elcliente from cliente where nrocliente = numcliente;  
+//consulta el registro de tarjeta que tenga el mismo número que el cliente del parametro. Guarda la fila obtenida en la variable sutarjeta       select * into sutarjeta from tarjeta where nrocliente = numcliente;   
+//extrae el último caracter de su tarjeta de crédito y lo guarda en la variable temtarjeta                                                       termtarjeta:= substr(sutarjeta.nrotarjeta,16);  
+//consulta el registro de cierre que tenga la misma terminación que la tarjeta del cliente. Guarda la fila obtenida en la variable sucierre      select * into sucierre from cierre where terminacion = termtarjeta; 
+
+El siguente ciclo se encarga de calcular el total a pagar. Recorre los registros de la relación compra
+Por cada compra cuyo mes sea igual período del parametro y su número de tarjeta ultilizada sea igual al del cliente, sumara el monto en la variable total
+ 
+ for v in select * from compra loop
+          mes:= extract(month from v.fecha);
+          if mes = periodo and v.nrotarjeta = sutarjeta.nrotarjeta then 
+             total:= total + v.monto;
+          end if;  
+        end loop;
+ 
+Luego se inserta un nuevo registro en cabecera con los valores obtenidos:       
+ 
+ insert into cabecera values(numresumen,elcliente.nombre,elcliente.apellido,elcliente.domicilio,sutarjeta.nrotarjeta,sucierre.fechainicio,sucierre.fechacierre,sucierre.fechavto,total); 
+ 
+Por último se realiza otro ciclo para detallar las compras del resumen. Se recorren todas las compras. 
+Por cada compra cuyo número de tarjeta sea igual al del cliente y su mes sea igual al periodo del parametro, se consulta el nombre del comercio correspondiente al número de comercio de la compra y se guarda en la variable nomcomercio.
+Luego se inserta una fila nueva en la relación detalle con los valores obtenidos, y se incrementa el contador de lineas para el proximo insert de detalle.
+El contador de lineas se reinicia al valor 1 luego de terminar el ciclo.
+ 
+ for w in select * from compra loop  
+          if w.nrotarjeta = sutarjeta.nrotarjeta and mes = periodo then
+              select nombre into nomcomercio from comercio where nrocomercio = w.nrocomercio; 
+             insert into detalle values (numresumen,numlinea,w.fecha,nomcomercio,w.monto);
+             numlinea:= numlinea +1;
+          end if;
+        end loop; 
+        numlinea:= 1;  
+        
+=== Conclusiones
+
+En conclusion, la implementación funcionó como se esperaba. Si bien tuvimos dificultades, logramos solucionarlas
+por medio del ensayo y error. Las consultas a la documentacion oficial de postgres fueron de gran ayuda tanto para
+el desarrollo del código como para la planificación del mismo.
+
