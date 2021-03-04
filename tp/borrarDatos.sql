@@ -1,0 +1,10 @@
+delete from cliente;
+delete from tarjeta;
+delete from comercio;
+delete from compra;
+delete from rechazo;
+delete from cierre;
+delete from cabecera;
+delete from detalle;
+delete from alerta;
+delete from consumo;
